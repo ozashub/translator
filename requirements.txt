@@ -1,0 +1,6 @@
+keyboard
+pyperclip
+openai
+pystray
+Pillow
+keyring
