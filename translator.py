@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import time
 import threading
 import importlib
@@ -5,11 +6,7 @@ import sys
 import subprocess
 import os
 import ctypes
-from ctypes import wintypes
 
-# ---------------------------------------------------------------------------
-# Lazy-loaded modules (populated by check_deps)
-# ---------------------------------------------------------------------------
 kb = None
 clip = None
 openai = None
@@ -18,12 +15,10 @@ PIL = None
 winreg = None
 keyring = None
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 MODEL = "gpt-4.1-mini"
 DELAY_SELECT = 0.02
 DELAY_PASTE = 0.02
+RECONFIG_KEY = "f12"
 
 ANS_SUFFIX = "-r"
 DF_SUFFIX = "-df"
@@ -49,20 +44,22 @@ KEYRING_SERVICE = "translator"
 KEYRING_USERNAME = "openai_api_key"
 REG_PATH = r"Software\Translator"
 
-# ---------------------------------------------------------------------------
-# Mutable state
-# ---------------------------------------------------------------------------
 api_key = None
 hotkey = None
 tray_icon = None
-console_window = None
-is_minimized = False
+_console_hwnd = None
+_minimized = False
+_lock = threading.Lock()
 
-_processing_lock = threading.Lock()
+REQUIRED_MODULES = {
+    "keyboard":  "keyboard",
+    "pyperclip": "pyperclip",
+    "openai":    "openai",
+    "pystray":   "pystray",
+    "PIL":       "Pillow",
+    "keyring":   "keyring",
+}
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def show_banner():
     banner = r"""
@@ -80,25 +77,10 @@ def log(msg, pfx="*"):
     print(f"[{pfx}] {msg}")
 
 
-# ---------------------------------------------------------------------------
-# Dependency management
-# ---------------------------------------------------------------------------
-
-REQUIRED_MODULES = {
-    "keyboard":  "keyboard",
-    "pyperclip": "pyperclip",
-    "openai":    "openai",
-    "pystray":   "pystray",
-    "PIL":       "Pillow",
-    "keyring":   "keyring",
-}
-
-
 def check_deps():
     global kb, clip, openai, tray, PIL, winreg, keyring
 
     missing = []
-
     for mod_name, pip_name in REQUIRED_MODULES.items():
         try:
             if mod_name == "PIL":
@@ -124,49 +106,47 @@ def check_deps():
         except ImportError:
             pass
 
-    if missing:
-        log("Missing dependencies. Installing...", "!")
-        for name in missing:
-            log(f"  - {name}", "!")
+    if not missing:
+        return
 
-        cmd = [sys.executable, "-m", "pip", "install"] + missing
-        try:
-            res = subprocess.run(cmd, check=False, capture_output=True, text=True)
-            if res.returncode == 0:
-                log("Installation successful! Restarting...", "*")
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-            else:
-                log("Automatic installation failed.", "!")
-                log(f"Please run: pip install {' '.join(missing)}", "!")
-                sys.exit(1)
-        except Exception as e:
-            log(f"Installation error: {e}", "!")
+    log("Missing dependencies. Installing...", "!")
+    for name in missing:
+        log(f"  - {name}", "!")
+
+    cmd = [sys.executable, "-m", "pip", "install"] + missing
+    try:
+        res = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        if res.returncode == 0:
+            log("Installation successful! Restarting...", "*")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        else:
+            log("Automatic installation failed.", "!")
             log(f"Please run: pip install {' '.join(missing)}", "!")
             sys.exit(1)
+    except Exception as e:
+        log(f"Installation error: {e}", "!")
+        log(f"Please run: pip install {' '.join(missing)}", "!")
+        sys.exit(1)
 
 
-# ---------------------------------------------------------------------------
-# Registry helpers (hotkey only — API key uses keyring)
-# ---------------------------------------------------------------------------
-
-def reg_get(key_name):
+def reg_get(name):
     if sys.platform != "win32" or not winreg:
         return None
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_READ)
-        val, _ = winreg.QueryValueEx(key, key_name)
+        val, _ = winreg.QueryValueEx(key, name)
         winreg.CloseKey(key)
         return val
     except OSError:
         return None
 
 
-def reg_set(key_name, val):
+def reg_set(name, val):
     if sys.platform != "win32" or not winreg:
         return False
     try:
         key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, REG_PATH)
-        winreg.SetValueEx(key, key_name, 0, winreg.REG_SZ, val)
+        winreg.SetValueEx(key, name, 0, winreg.REG_SZ, val)
         winreg.CloseKey(key)
         return True
     except OSError as e:
@@ -174,26 +154,23 @@ def reg_set(key_name, val):
         return False
 
 
-def reg_delete(key_name):
+def reg_delete(name):
     if sys.platform != "win32" or not winreg:
         return
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_SET_VALUE)
-        winreg.DeleteValue(key, key_name)
+        winreg.DeleteValue(key, name)
         winreg.CloseKey(key)
     except OSError:
         pass
 
 
-# ---------------------------------------------------------------------------
-# API key management (keyring + migration from registry)
-# ---------------------------------------------------------------------------
-
-def _migrate_api_key_from_registry():
-    old_key = reg_get("ApiKey")
-    if old_key and old_key.startswith("sk-"):
+def _migrate_api_key():
+    # one-time migration from plaintext registry to keyring
+    old = reg_get("ApiKey")
+    if old and old.startswith("sk-"):
         try:
-            keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, old_key)
+            keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, old)
             reg_delete("ApiKey")
             log("Migrated API key from registry to secure storage.", "*")
         except Exception as e:
@@ -203,7 +180,7 @@ def _migrate_api_key_from_registry():
 def load_api_key():
     global api_key
 
-    _migrate_api_key_from_registry()
+    _migrate_api_key()
 
     saved = keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
     if saved and saved.startswith("sk-"):
@@ -230,10 +207,6 @@ def load_api_key():
             log(f"Input error: {e}", "!")
 
 
-# ---------------------------------------------------------------------------
-# OpenAI integration
-# ---------------------------------------------------------------------------
-
 def call_ai(messages, temperature=0.7):
     try:
         client = openai.OpenAI(api_key=api_key)
@@ -248,10 +221,6 @@ def call_ai(messages, temperature=0.7):
         log(f"OpenAI error: {e}", "!")
         return None
 
-
-# ---------------------------------------------------------------------------
-# Text transformations
-# ---------------------------------------------------------------------------
 
 IMPROVE_SYSTEM = (
     "You rewrite messages to be clearer and more concise. Rules:\n"
@@ -271,11 +240,11 @@ IMPROVE_SYSTEM = (
 
 
 def improve_text(txt):
-    messages = [
+    msgs = [
         {"role": "system", "content": IMPROVE_SYSTEM},
         {"role": "user", "content": txt},
     ]
-    return call_ai(messages, temperature=0.95)
+    return call_ai(msgs, temperature=0.95)
 
 
 DEFORMALISE_SYSTEM = (
@@ -290,11 +259,11 @@ DEFORMALISE_SYSTEM = (
 
 
 def deformalise_text(txt):
-    messages = [
+    msgs = [
         {"role": "system", "content": DEFORMALISE_SYSTEM},
         {"role": "user", "content": txt},
     ]
-    return call_ai(messages, temperature=0.8)
+    return call_ai(msgs, temperature=0.8)
 
 
 ANSWER_SYSTEM = (
@@ -304,11 +273,11 @@ ANSWER_SYSTEM = (
 
 
 def get_answer(txt):
-    messages = [
+    msgs = [
         {"role": "system", "content": ANSWER_SYSTEM},
         {"role": "user", "content": txt},
     ]
-    return call_ai(messages, temperature=0.4)
+    return call_ai(msgs, temperature=0.4)
 
 
 TRANSLATE_TO_EN_SYSTEM = (
@@ -340,49 +309,41 @@ def translate_text(txt, lang):
         system = TRANSLATE_SYSTEM.format(lang=lang)
         temp = 0.3
 
-    messages = [
+    msgs = [
         {"role": "system", "content": system},
         {"role": "user", "content": txt},
     ]
-    return call_ai(messages, temperature=temp)
+    return call_ai(msgs, temperature=temp)
 
-
-# ---------------------------------------------------------------------------
-# Suffix parsing
-# ---------------------------------------------------------------------------
 
 ALL_SUFFIXES = {ANS_SUFFIX: "answer", DF_SUFFIX: "deformalise"}
 ALL_SUFFIXES.update({sfx: "translate" for sfx in LANG_SUFFIXES})
 
 
 def parse_operations(text):
-    operations = []
+    ops = []
     while True:
         matched = False
         lower = text.lower()
-        for sfx, op_type in ALL_SUFFIXES.items():
+        for sfx, kind in ALL_SUFFIXES.items():
             if lower.endswith(sfx.lower()):
-                operations.insert(0, (op_type, sfx))
-                text = text[: -len(sfx)].strip()
+                ops.insert(0, (kind, sfx))
+                text = text[:-len(sfx)].strip()
                 matched = True
                 break
         if not matched:
             break
 
-    if not text and operations:
+    if not text and ops:
         return None, []
 
-    if not operations:
-        operations = [("improve", None)]
+    if not ops:
+        ops = [("improve", None)]
 
-    return text, operations
+    return text, ops
 
 
-# ---------------------------------------------------------------------------
-# Clipboard & hotkey processing
-# ---------------------------------------------------------------------------
-
-def is_console_focused():
+def _console_focused():
     if sys.platform != "win32":
         return False
     try:
@@ -390,19 +351,19 @@ def is_console_focused():
         hwnd = user32.GetForegroundWindow()
         if not hwnd:
             return False
-        class_name = ctypes.create_unicode_buffer(256)
-        user32.GetClassNameW(hwnd, class_name, 256)
-        return "consolewindowclass" in class_name.value.lower()
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buf, 256)
+        return "consolewindowclass" in buf.value.lower()
     except OSError:
         return False
 
 
 def process_text():
-    if not _processing_lock.acquire(blocking=False):
+    if not _lock.acquire(blocking=False):
         return
 
     try:
-        if is_console_focused():
+        if _console_focused():
             return
 
         kb.press_and_release("ctrl+a")
@@ -412,24 +373,25 @@ def process_text():
 
         content = clip.paste().strip()
 
+        # strip the hotkey char itself if it's a single printable key
         if hotkey and len(hotkey) == 1 and content.endswith(hotkey):
-            content = content[: -len(hotkey)].strip()
+            content = content[:-len(hotkey)].strip()
 
         if not content:
             return
 
-        text, operations = parse_operations(content)
+        text, ops = parse_operations(content)
         if text is None:
             return
 
-        for op_type, op_data in operations:
-            if op_type == "answer":
+        for kind, data in ops:
+            if kind == "answer":
                 text = get_answer(text)
-            elif op_type == "deformalise":
+            elif kind == "deformalise":
                 text = deformalise_text(text)
-            elif op_type == "translate":
-                text = translate_text(text, LANG_SUFFIXES[op_data])
-            elif op_type == "improve":
+            elif kind == "translate":
+                text = translate_text(text, LANG_SUFFIXES[data])
+            elif kind == "improve":
                 text = improve_text(text)
 
             if not text:
@@ -443,54 +405,49 @@ def process_text():
     except Exception as e:
         log(f"Processing error: {e}", "!")
     finally:
-        _processing_lock.release()
+        _lock.release()
 
 
 def on_hotkey():
     threading.Thread(target=process_text, daemon=True).start()
 
 
-# ---------------------------------------------------------------------------
-# Window & tray management
-# ---------------------------------------------------------------------------
-
 def show_window():
-    global is_minimized
-    if sys.platform == "win32" and console_window:
+    global _minimized
+    if sys.platform == "win32" and _console_hwnd:
         try:
             user32 = ctypes.windll.user32
-            user32.ShowWindow(console_window, 9)
-            user32.SetForegroundWindow(console_window)
-            is_minimized = False
+            user32.ShowWindow(_console_hwnd, 9)
+            user32.SetForegroundWindow(_console_hwnd)
+            _minimized = False
         except OSError:
             pass
 
 
 def hide_window():
-    global is_minimized
-    if sys.platform == "win32" and console_window:
+    global _minimized
+    if sys.platform == "win32" and _console_hwnd:
         try:
-            user32 = ctypes.windll.user32
-            user32.ShowWindow(console_window, 0)
-            is_minimized = True
+            ctypes.windll.user32.ShowWindow(_console_hwnd, 0)
+            _minimized = True
         except OSError:
             pass
 
 
 def check_window_state():
-    if sys.platform == "win32" and console_window:
+    if sys.platform == "win32" and _console_hwnd:
         try:
-            if ctypes.windll.user32.IsIconic(console_window) and not is_minimized:
+            if ctypes.windll.user32.IsIconic(_console_hwnd) and not _minimized:
                 hide_window()
         except OSError:
             pass
 
 
-def setup_minimize_to_tray():
-    global console_window
+def setup_tray_minimize():
+    global _console_hwnd
     if sys.platform == "win32":
         try:
-            console_window = ctypes.windll.kernel32.GetConsoleWindow()
+            _console_hwnd = ctypes.windll.kernel32.GetConsoleWindow()
         except OSError:
             pass
 
@@ -516,10 +473,6 @@ def stop_tray():
     kb.unhook_all()
     sys.exit(0)
 
-
-# ---------------------------------------------------------------------------
-# Hotkey configuration
-# ---------------------------------------------------------------------------
 
 def capture_key():
     captured = [None]
@@ -638,19 +591,15 @@ def redo_hotkey():
         except Exception:
             pass
 
-    kb.add_hotkey("f12", on_f12)
+    kb.add_hotkey(RECONFIG_KEY, on_reconfig)
 
     os.system("cls" if sys.platform == "win32" else "clear")
     show_info()
 
 
-def on_f12():
+def on_reconfig():
     threading.Thread(target=redo_hotkey, daemon=True).start()
 
-
-# ---------------------------------------------------------------------------
-# Info display
-# ---------------------------------------------------------------------------
 
 def show_info():
     show_banner()
@@ -662,12 +611,8 @@ def show_info():
         log(f"  {sfx:8} Translate to {lang}", "*")
     print()
     log("Running in system tray. Press Ctrl+C to quit.", "*")
-    log("Press F12 to change hotkey.", "*")
+    log(f"Press {RECONFIG_KEY.upper()} to change hotkey.", "*")
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 def main():
     show_banner()
@@ -684,10 +629,10 @@ def main():
     os.system("cls" if sys.platform == "win32" else "clear")
     show_info()
 
-    kb.add_hotkey("f12", on_f12)
+    kb.add_hotkey(RECONFIG_KEY, on_reconfig)
 
     if sys.platform == "win32":
-        setup_minimize_to_tray()
+        setup_tray_minimize()
 
     threading.Thread(target=create_tray, daemon=True).start()
 
