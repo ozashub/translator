@@ -14,7 +14,7 @@ PIL = None
 winreg = None
 keyring = None
 
-MODEL = "gpt-4.1-mini"
+MODEL = "gpt-4.1"
 PROMPT_MODEL = "gpt-4.1"
 DELAY_SELECT = 0.02
 DELAY_PASTE = 0.02
